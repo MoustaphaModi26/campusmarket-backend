@@ -5,194 +5,150 @@ const fetch = require("node-fetch");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
+const BACKEND_URL = process.env.RENDER_EXTERNAL_URL || "";
+const NOTCHPAY_PUBLIC_KEY = process.env.NOTCHPAY_PUBLIC_KEY;
+const NOTCHPAY_BASE_URL = "https://api.notchpay.co";
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// ─── Config CamPay ───────────────────────────────────────────────────────────
-
-const CAMPAY_BASE_URL = process.env.CAMPAY_BASE_URL || "https://demo.campay.net/api";
-const CAMPAY_USERNAME = process.env.CAMPAY_USERNAME;
-const CAMPAY_PASSWORD = process.env.CAMPAY_PASSWORD;
-
-// ─── Obtenir un token CamPay ──────────────────────────────────────────────────
-
-const getCamPayToken = async () => {
-  const response = await fetch(`${CAMPAY_BASE_URL}/token/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: CAMPAY_USERNAME,
-      password: CAMPAY_PASSWORD,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error("Impossible de s'authentifier à CamPay");
-  }
-
-  const data = await response.json();
-  return data.token;
-};
-
-// ─── Route : Vérification que le serveur tourne ───────────────────────────────
+// ─── Route santé ─────────────────────────────────────────────────────────────
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "CampusMarket Backend opérationnel",
-    version: "1.0.0",
+    notchpay: NOTCHPAY_PUBLIC_KEY ? "configuré" : "MANQUANT",
   });
 });
 
-// ─── Route : Initier un paiement ─────────────────────────────────────────────
+// ─── Initialiser un paiement NotchPay ────────────────────────────────────────
 
-app.post("/api/payment/collect", async (req, res) => {
+app.post("/api/payment/initialize", async (req, res) => {
+  console.log("=== INITIALIZE PAYMENT ===");
+  console.log("Body:", JSON.stringify(req.body));
+
   try {
-    const { amount, phoneNumber, description, externalReference } = req.body;
+    const {
+      amount,
+      phoneNumber,
+      description,
+      externalReference,
+      customerName,
+      customerEmail,
+    } = req.body;
 
-    // Validation
     if (!amount || !phoneNumber || !description) {
       return res.status(400).json({
         error: "Paramètres manquants : amount, phoneNumber, description requis.",
       });
     }
 
-    if (!CAMPAY_USERNAME || !CAMPAY_PASSWORD) {
-      return res.status(500).json({
-        error: "Clés CamPay non configurées sur le serveur.",
-      });
-    }
+    const payload = {
+      amount,
+      currency: "XAF",
+      description,
+      reference: externalReference || `CM_${Date.now()}`,
+      customer: {
+        name: customerName || "Client CampusMarket",
+        email: customerEmail || "client@campusmarket.cm",
+        phone: phoneNumber,
+      },
+      callback: `${BACKEND_URL}/api/payment/callback`,
+    };
 
-    const token = await getCamPayToken();
+    console.log("Payload NotchPay:", JSON.stringify(payload));
 
-    const response = await fetch(`${CAMPAY_BASE_URL}/collect/`, {
+    const response = await fetch(`${NOTCHPAY_BASE_URL}/payments/initialize`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Token ${token}`,
+        "Authorization": NOTCHPAY_PUBLIC_KEY,
       },
-      body: JSON.stringify({
-        amount: String(amount),
-        currency: "XAF",
-        from: phoneNumber,
-        description,
-        external_reference: externalReference || `CM_${Date.now()}`,
-      }),
+      body: JSON.stringify(payload),
     });
 
     const data = await response.json();
+    console.log("Réponse NotchPay:", JSON.stringify(data));
 
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: data.message || "Erreur CamPay lors de la collecte.",
+    if (!response.ok || data.code !== 201) {
+      return res.status(400).json({
+        error: data.message || "Erreur NotchPay",
+        details: data,
       });
     }
 
     return res.json({
-      reference: data.reference,
-      ussd_code: data.ussd_code,
-      operator: data.operator,
+      status: "success",
+      paymentUrl: data.authorization_url,
+      reference: data.transaction.reference,
+      transactionId: data.transaction.id,
     });
 
   } catch (e) {
-    console.error("Erreur collect:", e.message);
+    console.error("ERREUR initialize:", e.message);
     return res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Route : Vérifier le statut d'un paiement ────────────────────────────────
+// ─── Vérifier le statut d'un paiement ────────────────────────────────────────
 
-app.get("/api/payment/status/:reference", async (req, res) => {
+app.get("/api/payment/verify/:reference", async (req, res) => {
+  console.log("=== VERIFY PAYMENT ===", req.params.reference);
+
   try {
-    const { reference } = req.params;
-
-    if (!reference) {
-      return res.status(400).json({ error: "Référence manquante." });
-    }
-
-    const token = await getCamPayToken();
-
     const response = await fetch(
-      `${CAMPAY_BASE_URL}/transaction/${reference}/`,
+      `${NOTCHPAY_BASE_URL}/payments/${req.params.reference}`,
       {
         method: "GET",
-        headers: { Authorization: `Token ${token}` },
+        headers: {
+          "Authorization": NOTCHPAY_PUBLIC_KEY,
+        },
       }
     );
 
     const data = await response.json();
+    console.log("Réponse verify:", JSON.stringify(data));
 
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: data.message || "Erreur lors de la vérification.",
-      });
+      return res.status(400).json({ error: data.message || "Erreur vérification" });
     }
 
     return res.json({
-      status: data.status,
-      reference: data.reference,
-      amount: data.amount,
-      operator: data.operator,
-      external_reference: data.external_reference,
+      status: data.transaction?.status ?? "unknown",
+      reference: data.transaction?.reference,
+      amount: data.transaction?.amount,
+      currency: data.transaction?.currency,
     });
 
   } catch (e) {
-    console.error("Erreur status:", e.message);
+    console.error("ERREUR verify:", e.message);
     return res.status(500).json({ error: e.message });
   }
 });
 
-// ─── Route : Initier un boost ─────────────────────────────────────────────────
+// ─── Callback NotchPay (webhook) ──────────────────────────────────────────────
 
-app.post("/api/payment/boost", async (req, res) => {
-  try {
-    const { amount, phoneNumber, planId, listingId, sellerName } = req.body;
-
-    if (!amount || !phoneNumber || !planId || !listingId) {
-      return res.status(400).json({ error: "Paramètres manquants." });
-    }
-
-    const token = await getCamPayToken();
-
-    const response = await fetch(`${CAMPAY_BASE_URL}/collect/`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Token ${token}`,
-      },
-      body: JSON.stringify({
-        amount: String(amount),
-        currency: "XAF",
-        from: phoneNumber,
-        description: `CampusMarket — Boost annonce ${planId}`,
-        external_reference: `BOOST_${listingId}_${Date.now()}`,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: data.message || "Erreur CamPay boost.",
-      });
-    }
-
-    return res.json({
-      reference: data.reference,
-      operator: data.operator,
-    });
-
-  } catch (e) {
-    console.error("Erreur boost:", e.message);
-    return res.status(500).json({ error: e.message });
-  }
+app.post("/api/payment/callback", (req, res) => {
+  console.log("=== CALLBACK NOTCHPAY ===");
+  console.log("Body:", JSON.stringify(req.body));
+  res.json({ status: "received" });
 });
 
-// ─── Démarrer le serveur ──────────────────────────────────────────────────────
+// ─── Auto-ping pour garder le backend éveillé ─────────────────────────────────
+
+if (BACKEND_URL) {
+  setInterval(async () => {
+    try {
+      await fetch(`${BACKEND_URL}/`);
+      console.log(`[PING] ${new Date().toISOString()}`);
+    } catch (e) {
+      console.error("[PING FAILED]", e.message);
+    }
+  }, 10 * 60 * 1000);
+}
 
 app.listen(PORT, () => {
-  console.log(`CampusMarket Backend démarré sur le port ${PORT}`);
+  console.log(`=== CampusMarket Backend démarré sur port ${PORT} ===`);
+  console.log(`NotchPay: ${NOTCHPAY_PUBLIC_KEY ? "OK" : "MANQUANT"}`);
 });
